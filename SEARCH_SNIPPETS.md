@@ -76,7 +76,7 @@ could show generic page text such as `Talk`, `Read`, or `View source`.
 
 5. Print snippets from the returned results.
 
-   Code: `main.go`
+   Code: `cmd/searchcli/main.go`
 
    The CLI now prints `result.Doc.FilePath`, `result.Score`, and each
    `snippet.Text`. A frontend can use `snippet.Matches` to highlight individual
@@ -91,10 +91,10 @@ Example:
 
 ```sh
 rm search.idx
-go run main.go add ../web-crawler
-go run main.go add ../search-engines
-go run main.go add ../information-retrieval
-go run main.go search "distributed computing"
+go run ./cmd/searchcli add ../web-crawler
+go run ./cmd/searchcli add ../search-engines
+go run ./cmd/searchcli add ../information-retrieval
+go run ./cmd/searchcli search "distributed computing"
 ```
 
 ## Verification

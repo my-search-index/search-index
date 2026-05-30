@@ -8,8 +8,8 @@ returns snippets with exact highlight ranges for the matching query terms.
 
 ```text
                     +------------------+
-                    |      CLI         |
-                    | main.go          |
+                    |  Library + CLI   |
+                    | searchindex.go   |
                     +--------+---------+
                              |
               +--------------+--------------+
@@ -37,6 +37,51 @@ returns snippets with exact highlight ranges for the matching query terms.
 The project is intentionally simple: no database, no background workers, and no
 external search service. Everything lives in memory while the command runs, then
 the index is saved to `search.idx`.
+
+## Using It As A Library
+
+The root module exposes the public package API. Another Go backend can import
+the project and call the search index directly.
+
+```go
+import searchindex "github.com/Stacvirus/search-index"
+```
+
+Example:
+
+```go
+idx, err := searchindex.Load("search.idx")
+if err != nil {
+	return err
+}
+
+results := idx.Search("distributed computing")
+documents := idx.ListDocuments()
+_ = results
+_ = documents
+
+if err := idx.AddDocument("../data/web-crawler.txt"); err != nil {
+	return err
+}
+
+if err := idx.Save("search.idx"); err != nil {
+	return err
+}
+```
+
+The root package is a small facade over the internal implementation package, so
+callers only need one import path. The main API is:
+
+```go
+searchindex.New()
+searchindex.Load(path)
+idx.Save(path)
+idx.AddDocument(path)
+idx.AddDocuments(root, extensions)
+idx.RemoveDocument(path)
+idx.ListDocuments()
+idx.Search(query)
+```
 
 ## Main Concepts
 
@@ -337,31 +382,31 @@ tokenization, stop-word filtering, or position logic.
 Index one file:
 
 ```sh
-go run main.go add ../data/web-crawler.txt
+go run ./cmd/searchcli add ../data/web-crawler.txt
 ```
 
 Index a directory of `.txt` and `.md` files:
 
 ```sh
-go run main.go add ../data
+go run ./cmd/searchcli add ../data
 ```
 
 Remove one indexed file:
 
 ```sh
-go run main.go remove ../data/web-crawler.txt
+go run ./cmd/searchcli remove ../data/web-crawler.txt
 ```
 
 List indexed files:
 
 ```sh
-go run main.go list
+go run ./cmd/searchcli list
 ```
 
 Search:
 
 ```sh
-go run main.go search "distributed computing"
+go run ./cmd/searchcli search "distributed computing"
 ```
 
 Example output:
@@ -392,7 +437,9 @@ Results for "distributed computing":
 │   ├── scorer.go       # TF-IDF scoring
 │   ├── snippet.go      # Snippet extraction and highlight ranges
 │   └── persist.go      # gob save/load
-├── main.go             # CLI commands
+├── cmd/searchcli/
+│   └── main.go         # CLI wrapper around the library
+├── searchindex.go      # Root package facade for external imports
 └── search.idx          # persisted local index, generated at runtime
 ```
 
@@ -413,6 +460,6 @@ If snippets look stale or point at strange lines, rebuild `search.idx`.
 
 ```sh
 rm search.idx
-go run main.go add ../data
-go run main.go search "distributed computing"
+go run ./cmd/searchcli add ../data
+go run ./cmd/searchcli search "distributed computing"
 ```

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Stacvirus/search-index/index"
+	searchindex "github.com/Stacvirus/search-index"
 )
 
 const indexPath = "search.idx"
@@ -68,7 +68,7 @@ func commandArg() (string, bool) {
 }
 
 func addPath(path string) error {
-	idx, err := index.Load(indexPath)
+	idx, err := searchindex.Load(indexPath)
 	if err != nil {
 		return fmt.Errorf("loading index: %w", err)
 	}
@@ -96,7 +96,7 @@ func addPath(path string) error {
 }
 
 func removePath(path string) error {
-	idx, err := index.Load(indexPath)
+	idx, err := searchindex.Load(indexPath)
 	if err != nil {
 		return fmt.Errorf("loading index: %w", err)
 	}
@@ -114,7 +114,7 @@ func removePath(path string) error {
 }
 
 func listDocuments() error {
-	idx, err := index.Load(indexPath)
+	idx, err := searchindex.Load(indexPath)
 	if err != nil {
 		return fmt.Errorf("loading index: %w", err)
 	}
@@ -128,7 +128,7 @@ func listDocuments() error {
 }
 
 func search(query string) error {
-	idx, err := index.Load(indexPath)
+	idx, err := searchindex.Load(indexPath)
 	if err != nil {
 		return fmt.Errorf("loading index: %w", err)
 	}
@@ -152,9 +152,9 @@ func search(query string) error {
 
 func printUsage() {
 	fmt.Println("Usage:")
-	fmt.Println(" go run main.go add <filepath.extension>")
-	fmt.Println(" go run main.go add <directory>")
-	fmt.Println(" go run main.go remove <filepath.extension>")
-	fmt.Println(" go run main.go list")
-	fmt.Println(" go run main.go search <query>")
+	fmt.Println(" go run ./cmd/searchcli add <filepath.extension>")
+	fmt.Println(" go run ./cmd/searchcli add <directory>")
+	fmt.Println(" go run ./cmd/searchcli remove <filepath.extension>")
+	fmt.Println(" go run ./cmd/searchcli list")
+	fmt.Println(" go run ./cmd/searchcli search <query>")
 }

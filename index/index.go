@@ -299,6 +299,7 @@ func (idx *Index) rankDocuments(postings PostingList, tokens []analysis.Token) [
 	return scoredList
 }
 
+// Binary search posting algo impl
 func searchPosting(list PostingList, docID int) Posting {
 	last, first := len(list), 0
 	for first < last {
