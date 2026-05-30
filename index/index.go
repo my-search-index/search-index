@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/Stacvirus/search-index/analysis"
+	"github.com/my-search-index/search-index/analysis"
 )
 
 // Index stores documents and their inverted posting lists.

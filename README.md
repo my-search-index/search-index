@@ -44,7 +44,7 @@ The root module exposes the public package API. Another Go backend can import
 the project and call the search index directly.
 
 ```go
-import searchindex "github.com/Stacvirus/search-index"
+import searchindex "github.com/my-search-index/search-index"
 ```
 
 Example:

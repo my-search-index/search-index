@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	searchindex "github.com/Stacvirus/search-index"
+	searchindex "github.com/my-search-index/search-index"
 )
 
 const indexPath = "search.idx"

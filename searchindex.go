@@ -1,7 +1,7 @@
 // Package searchindex exposes a small file-based search index library.
 package searchindex
 
-import "github.com/Stacvirus/search-index/index"
+import "github.com/my-search-index/search-index/index"
 
 type Index = index.Index
 type Document = index.Document

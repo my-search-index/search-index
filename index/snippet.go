@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Stacvirus/search-index/analysis"
+	"github.com/my-search-index/search-index/analysis"
 )
 
 const snippetContext = 60

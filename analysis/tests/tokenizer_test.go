@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/Stacvirus/search-index/analysis"
+	"github.com/my-search-index/search-index/analysis"
 )
 
 func TestTokenize(t *testing.T) {
