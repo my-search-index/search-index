@@ -27,8 +27,9 @@ type Document struct {
 }
 
 type scoredDocs struct {
-	doc   Document
-	score float64
+	doc      Document
+	score    float64
+	postings []Posting
 }
 
 // Match is a query term occurrence inside Snippet.Text.
@@ -219,37 +220,56 @@ func (idx *Index) buildIndex(tokens []analysis.Token, docID int) {
 	}
 }
 
-// Search returns ranked documents for query, including matching snippets.
-// The index already stores posting positions, so no index schema changes are
-// needed to attach snippets to each result.
-func (idx *Index) Search(query string) []Result {
-	// Analyze the query to get the tokens
-	tokens := analysis.Analyze(query)
-	lists := idx.getPostings(tokens)
-	result := idx.unionPostings(lists)
-	scoredList := idx.rankDocuments(result, tokens)
+// Search returns ranked documents for query.
+//
+// The query is parsed exactly once here; the parsed words flow through
+// candidate selection, ranking and snippet extraction. Parse failures
+// (ErrUnterminatedQuote, ErrEmptyPhrase) are returned unchanged so callers can
+// use errors.Is. An empty or all-stopword query is not an error: it returns
+// no results.
+//
+// Snippets are only extracted for the top snippetResultLimit results, because
+// each one reopens and scans a source file.
+func (idx *Index) Search(query string) ([]Result, error) {
+	q, err := parseQuery(query)
+	if err != nil {
+		return nil, err
+	}
+
+	words := q.words()
+	var candidates PostingList
+	if q.hasPhrases() {
+		candidates = idx.phraseCandidates(q.Phrases)
+	} else {
+		candidates = idx.unionPostings(idx.getPostings(q.Terms))
+	}
+	ranked := idx.rankDocuments(candidates, words)
 
 	var results []Result
-	for _, scored := range scoredList {
+	for i, scored := range ranked {
 		result := Result{
-			Doc:      scored.doc,
-			Snippets: nil,
-			Score:    scored.score,
+			Doc:   scored.doc,
+			Score: scored.score,
 		}
-		results = append(results, idx.ExtractSnippets(result, query))
+		if i < snippetResultLimit {
+			result.Snippets = extractSnippets(scored.doc, scored.postings)
+		}
+		results = append(results, result)
 	}
-	return results
+	return results, nil
 }
 
-func (idx *Index) getPostings(tokens []analysis.Token) []PostingList {
-	if len(tokens) == 0 {
+// getPostings returns the posting list of every query word that exists in the
+// index. Unknown words are skipped, which is what makes the search an OR.
+func (idx *Index) getPostings(words []string) []PostingList {
+	if len(words) == 0 {
 		return nil
 	}
 
 	var result []PostingList
 
-	for _, token := range tokens {
-		list := idx.Postings[token.Word]
+	for _, word := range words {
+		list := idx.Postings[word]
 		if len(list) == 0 {
 			continue // We can skip tokens that don't exist in the index, as they won't contribute to the search results
 		}
@@ -278,25 +298,130 @@ func (idx *Index) unionPostings(lists []PostingList) PostingList {
 	return result
 }
 
-func (idx *Index) rankDocuments(postings PostingList, tokens []analysis.Token) []scoredDocs {
+// rankDocuments scores every candidate against the query words and returns
+// them best first. While scoring it keeps each word's posting for the
+// document, so snippets can reuse the positions without another lookup.
+func (idx *Index) rankDocuments(candidates PostingList, words []string) []scoredDocs {
 	var scoredList []scoredDocs
 
-	for _, posting := range postings {
-		doc := idx.Docs[posting.DocID]
+	for _, candidate := range candidates {
+		doc := idx.Docs[candidate.DocID]
 		totalScore := 0.0
-		for _, token := range tokens {
-			list := idx.Postings[token.Word]
-			totalScore += Score(searchPosting(list, posting.DocID), doc, len(list), idx.TotalDocs)
+		var matched []Posting
+
+		for _, word := range words {
+			list := idx.Postings[word]
+			posting := searchPosting(list, candidate.DocID)
+			if posting.DocID == 0 {
+				continue // this word does not occur in this document, zero contribution
+			}
+			totalScore += Score(posting, doc, len(list), idx.TotalDocs)
+			matched = append(matched, posting)
 		}
-		scoredList = append(scoredList, scoredDocs{doc, totalScore})
+		scoredList = append(scoredList, scoredDocs{doc: doc, score: totalScore, postings: matched})
 	}
 
-	// Sort the scored documents by score in descending order
+	// Sort by score, best first. Stable, so ties keep a deterministic order.
 	sort.Slice(scoredList, func(i, j int) bool {
 		return scoredList[i].score > scoredList[j].score
 	})
 
 	return scoredList
+}
+
+// phraseCandidates returns documents that match every phrase.
+// The caller must provide at least one phrase. Bare terms do not affect this
+// candidate set; they are used later for scoring.
+func (idx *Index) phraseCandidates(phrases []phrase) PostingList {
+	candidates := idx.matchPhrase(phrases[0])
+
+	for _, p := range phrases[1:] {
+		if len(candidates) == 0 {
+			return nil
+		}
+
+		matched := make(map[int]bool)
+		for _, posting := range idx.matchPhrase(p) {
+			matched[posting.DocID] = true
+		}
+
+		kept := candidates[:0]
+		for _, posting := range candidates {
+			if matched[posting.DocID] {
+				kept = append(kept, posting)
+			}
+		}
+		candidates = kept
+	}
+	return candidates
+}
+
+// matchPhrase returns one posting per document containing the phrase at the
+// required relative positions. It starts with the shortest term posting list
+// to avoid checking documents that cannot match.
+func (idx *Index) matchPhrase(p phrase) PostingList {
+	lists := make([]PostingList, len(p.Terms))
+	shortest := 0
+
+	for i, term := range p.Terms {
+		lists[i] = idx.Postings[term.Word]
+		if len(lists[i]) == 0 {
+			return nil // Every phrase word is required.
+		}
+		if len(lists[i]) < len(lists[shortest]) {
+			shortest = i
+		}
+	}
+
+	var matches PostingList
+	for _, anchor := range lists[shortest] {
+		postings := make([]Posting, len(lists))
+		postings[shortest] = anchor
+
+		allWordsPresent := true
+		for i, list := range lists {
+			if i == shortest {
+				continue
+			}
+			postings[i] = searchPosting(list, anchor.DocID)
+			if postings[i].DocID == 0 {
+				allWordsPresent = false
+				break
+			}
+		}
+		if allWordsPresent && matchesPhrasePositions(p, postings, shortest) {
+			matches = append(matches, anchor)
+		}
+	}
+	return matches
+}
+
+// matchesPhrasePositions reports whether the phrase occurs in one document.
+// The anchor may be any phrase term, so its offset is subtracted to find each
+// possible start position. Posting positions must be sorted.
+func matchesPhrasePositions(p phrase, postings []Posting, anchorIndex int) bool {
+	for _, anchorPos := range postings[anchorIndex].Positions {
+		start := anchorPos - p.Terms[anchorIndex].Offset
+		if start < 0 {
+			continue
+		}
+
+		matchesHere := true
+		for i, term := range p.Terms {
+			wanted := start + term.Offset
+			positions := postings[i].Positions
+			at := sort.SearchInts(positions, wanted)
+
+			if at == len(positions) || positions[at] != wanted {
+				matchesHere = false
+				break
+			}
+		}
+		if matchesHere {
+			return true
+		}
+	}
+	return false
 }
 
 // Binary search posting algo impl

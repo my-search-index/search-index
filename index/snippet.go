@@ -3,83 +3,131 @@ package index
 import (
 	"bufio"
 	"os"
-	"sort"
 	"strings"
-
-	"github.com/my-search-index/search-index/analysis"
+	"unicode/utf8"
 )
 
-const snippetContext = 60
+// snippetContext is how many bytes of the line are kept on each side of
+// the first match in a snippet.
+const (
+	snippetContext = 60
 
-// ExtractSnippets finds the source lines that contain this result's query
-// matches. It uses Posting.Positions as document-wide token offsets, reopens
-// the document, and returns short snippets with highlight ranges.
-func (idx *Index) ExtractSnippets(result Result, query string) Result {
-	tokens := analysis.Analyze(query)
-	targetPositions := make(map[int]bool)
-	terms := uniqueTerms(tokens)
+	// snippetResultLimit caps how many results (best first) get snippets.
+	// Every snippet reopens and scans a source file, so extracting them for a
+	// broad OR query over hundreds of documents would dominate the cost of a
+	// search. Results beyond the limit are still returned, without snippets.
+	snippetResultLimit = 20
+)
 
-	for _, token := range tokens {
-		posting := searchPosting(idx.Postings[token.Word], result.Doc.ID)
-		if posting.DocID == 0 {
-			continue
-		}
-		for _, pos := range posting.Positions {
-			targetPositions[pos] = true
-		}
+// tokenSpan is the byte range [start, end] of one raw token inside a line.
+type tokenSpan struct {
+	start int
+	end   int
+}
+
+// extractSnippets returns one snippet per source line that contains a match.
+//
+// postings are the postings of the query words for this document, already
+// fetched by ranking. Their Positions are document-wide raw-token offsets (the
+// same numbering AddDocument used). Rather than searching the line for the
+// query text again, we walk the line's tokens, number them the way indexing
+// did, and highlight exactly the tokens whose position is a match. That is
+// what makes highlighting precise: it can never mark a word that was not
+// matched, and it does not depend on the matched word looking like the query
+// word (so it keeps working if stemming is added to analysis).
+//
+// Failures to read the file simply produce no snippets; the result itself is
+// still valid.
+func extractSnippets(doc Document, postings []Posting) []Snippet {
+	targets, last := targetPositions(postings)
+	if len(targets) == 0 {
+		return nil
 	}
 
-	if len(targetPositions) == 0 {
-		return result
-	}
-
-	file, err := os.Open(result.Doc.FilePath)
+	file, err := os.Open(doc.FilePath)
 	if err != nil {
-		return result
+		return nil
 	}
 	defer file.Close()
 
-	positionOffset := 0
+	var snippets []Snippet
+	offset := 0 // raw tokens seen before the current line
 	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		lineTokens := analysis.Analyze(line)
 
-		for _, lineToken := range lineTokens {
-			if targetPositions[positionOffset+lineToken.Position] {
-				result.Snippets = append(result.Snippets, buildSnippet(line, terms))
-				break
+	// Once offset passes the last target position, every remaining line is
+	// behind us: stop reading instead of scanning to the end of the file.
+	for offset <= last && scanner.Scan() {
+		line := scanner.Text()
+		spans := tokenSpans(line)
+
+		var matches []Match
+		for i, span := range spans {
+			if _, hit := targets[offset+i]; hit {
+				matches = append(matches, Match{
+					Start: span.start,
+					End:   span.end,
+					Term:  strings.ToLower(line[span.start:span.end]),
+				})
 			}
 		}
-		positionOffset += len(analysis.Tokenize(line))
-	}
+		offset += len(spans)
 
-	return result
-}
-
-func uniqueTerms(tokens []analysis.Token) []string {
-	seen := make(map[string]bool)
-	var terms []string
-	for _, token := range tokens {
-		if !seen[token.Word] {
-			terms = append(terms, token.Word)
-			seen[token.Word] = true
+		if len(matches) > 0 {
+			snippets = append(snippets, buildSnippet(line, matches))
 		}
 	}
-	return terms
+	return snippets
 }
 
-func buildSnippet(line string, terms []string) Snippet {
-	matches := findMatches(line, terms)
-	if len(matches) == 0 {
-		return Snippet{Text: line}
+// targetPositions collects every matched position into a set and also returns
+// the largest one, which is the early-stop point for the file scan
+func targetPositions(postings []Posting) (map[int]struct{}, int) {
+	targets := make(map[int]struct{})
+	last := -1
+	for _, posting := range postings {
+		for _, pos := range posting.Positions {
+			targets[pos] = struct{}{}
+			if pos > last {
+				last = pos
+			}
+		}
 	}
+	return targets, last
+}
 
+// tokenSpans splits a line into raw tokens (runs of ASCII letters and digits)
+// and reports where each one sits. The count and order MUST match
+// analysis.Tokenize, because token i of the line is document position
+// offset+i. TestTokenSpansMatchTokenizer guards that invariant.
+func tokenSpans(line string) []tokenSpan {
+	var spans []tokenSpan
+	start := -1
+	for i := 0; i < len(line); i++ {
+		if isTokenChar(line[i]) {
+			if start < 0 {
+				start = i
+			}
+		} else if start >= 0 {
+			spans = append(spans, tokenSpan{start: start, end: i})
+			start = -1
+		}
+	}
+	if start >= 0 {
+		spans = append(spans, tokenSpan{start: start, end: len(line)})
+	}
+	return spans
+}
+
+// buildSnippet cuts a window around the first match of the line and keeps
+// the highlight ranges (relative to the window) of every match inside it.
+// matches must be in ascending order, which tokenSpans guarantees.
+func buildSnippet(line string, matches []Match) Snippet {
 	start, end := snippetWindow(line, matches[0])
 	snippet := Snippet{Text: line[start:end]}
+
 	for _, match := range matches {
 		if match.Start < start || match.End > end {
-			continue
+			continue // match falls outside the window
 		}
 		snippet.Matches = append(snippet.Matches, Match{
 			Start: match.Start - start,
@@ -90,55 +138,30 @@ func buildSnippet(line string, terms []string) Snippet {
 	return snippet
 }
 
-func findMatches(line string, terms []string) []Match {
-	lowerLine := strings.ToLower(line)
-	var matches []Match
-
-	for _, term := range terms {
-		startAt := 0
-		for {
-			relativeStart := strings.Index(lowerLine[startAt:], term)
-			if relativeStart == -1 {
-				break
-			}
-
-			start := startAt + relativeStart
-			end := start + len(term)
-			if isTokenBoundary(line, start, end) {
-				matches = append(matches, Match{
-					Start: start,
-					End:   end,
-					Term:  term,
-				})
-			}
-			startAt = end
-		}
-	}
-
-	sort.Slice(matches, func(i, j int) bool {
-		return matches[i].Start < matches[j].Start
-	})
-	return matches
-}
-
-func snippetWindow(line string, firstMatch Match) (int, int) {
-	start := firstMatch.Start - snippetContext
+// snippetWindow returns the byte range to display around the first match.
+// The edges are moved outward to rune boundaries so a multi-byte character is
+// never cut in half (which would produce invalid UTF-8 in the output).
+func snippetWindow(line string, first Match) (int, int) {
+	start := first.Start - snippetContext
 	if start < 0 {
 		start = 0
 	}
-	end := firstMatch.End + snippetContext
+	end := first.End + snippetContext
 	if end > len(line) {
 		end = len(line)
+	}
+
+	for start > 0 && !utf8.RuneStart(line[start]) {
+		start--
+	}
+	for end < len(line) && !utf8.RuneStart(line[end]) {
+		end++
 	}
 	return start, end
 }
 
-func isTokenBoundary(line string, start, end int) bool {
-	beforeOK := start == 0 || !isTokenChar(line[start-1])
-	afterOK := end == len(line) || !isTokenChar(line[end])
-	return beforeOK && afterOK
-}
-
+// isTokenChar reports whether char is part of a token. Keep in sync with the
+// tokenizer's split pattern in the analysis package.
 func isTokenChar(char byte) bool {
 	return (char >= 'a' && char <= 'z') ||
 		(char >= 'A' && char <= 'Z') ||
