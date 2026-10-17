@@ -128,12 +128,15 @@ func listDocuments() error {
 }
 
 func search(query string) error {
-	idx, err := searchindex.Load(indexPath)
+	idx, err := searchindex.Load(indexPath) // TODO: Consider caching the index in memory for faster searches.
 	if err != nil {
 		return fmt.Errorf("loading index: %w", err)
 	}
 
-	results := idx.Search(query)
+	results, err := idx.Search(query)
+	if err != nil {
+		return fmt.Errorf("invalid query: %w", err)
+	}
 	if len(results) == 0 {
 		fmt.Printf("no results found for %q\n", query)
 		return nil
@@ -157,4 +160,9 @@ func printUsage() {
 	fmt.Println(" go run ./cmd/searchcli remove <filepath.extension>")
 	fmt.Println(" go run ./cmd/searchcli list")
 	fmt.Println(" go run ./cmd/searchcli search <query>")
+	fmt.Println()
+	fmt.Println("Phrase queries use double quotes. Your shell strips unescaped quotes,")
+	fmt.Println("so wrap the whole query in single quotes:")
+	fmt.Println(` go run ./cmd/searchcli search '"golang search" tutorial'`)
+
 }

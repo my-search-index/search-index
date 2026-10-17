@@ -1,9 +1,22 @@
 package index
 
 import (
+	"errors"
 	"math"
 	"testing"
 )
+
+// mustSearch runs a query that is expected to parse and fails the test if
+// Search returns an error. Tests that expect an error call idx.Search directly.
+func mustSearch(t *testing.T, idx *Index, query string) []Result {
+	t.Helper()
+
+	results, err := idx.Search(query)
+	if err != nil {
+		t.Fatalf("Search(%q) unexpected error: %v", query, err)
+	}
+	return results
+}
 
 func TestAddDocument_FileAccess(t *testing.T) {
 	idx := NewIndex()
@@ -203,7 +216,7 @@ func TestRemoveDocument(t *testing.T) {
 			t.Fatalf("expected unique term golang to be removed")
 		}
 
-		results := idx.Search("golang python")
+		results := mustSearch(t, idx, "golang python")
 		if len(results) != 1 {
 			t.Fatalf("expected 1 result after removal, got %d", len(results))
 		}
@@ -235,7 +248,7 @@ func TestRemoveDocument(t *testing.T) {
 			t.Fatalf("expected remaining posting for doc 2, got doc %d", postings[0].DocID)
 		}
 
-		results := idx.Search("golang")
+		results := mustSearch(t, idx, "golang")
 		if len(results) != 1 || results[0].Doc.ID != 2 {
 			t.Fatalf("expected only doc 2 in search results, got %v", results)
 		}
@@ -301,7 +314,7 @@ func TestSearch(t *testing.T) {
 		path := makeTempFile(t, "golang is fast")
 		_ = idx.AddDocument(path)
 
-		results := idx.Search("golang")
+		results := mustSearch(t, idx, "golang")
 
 		if len(results) != 1 {
 			t.Fatalf("expected 1 result, got %d", len(results))
@@ -318,7 +331,7 @@ func TestSearch(t *testing.T) {
 		path := makeTempFile(t, "golang is fast")
 		_ = idx.AddDocument(path)
 
-		results := idx.Search("golang fast")
+		results := mustSearch(t, idx, "golang fast")
 
 		if len(results) != 1 {
 			t.Fatalf("expected 1 result, got %d", len(results))
@@ -335,10 +348,27 @@ func TestSearch(t *testing.T) {
 		path := makeTempFile(t, "golang is fast")
 		_ = idx.AddDocument(path)
 
-		results := idx.Search("golang python")
+		results := mustSearch(t, idx, "golang python")
 
 		if len(results) != 1 {
 			t.Errorf("expected 1 result, got %v", results)
+		}
+	})
+
+	t.Run("unknown term does not produce NaN scores", func(t *testing.T) {
+		idx := NewIndex()
+
+		path := makeTempFile(t, "golang is fast")
+		_ = idx.AddDocument(path)
+
+		results := mustSearch(t, idx, "golang zzzunknown")
+
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+
+		if math.IsNaN(results[0].Score) || math.IsInf(results[0].Score, 0) {
+			t.Errorf("expected a finite score, got %v", results[0].Score)
 		}
 	})
 
@@ -348,66 +378,104 @@ func TestSearch(t *testing.T) {
 		path := makeTempFile(t, "golang is fast")
 		_ = idx.AddDocument(path)
 
-		results := idx.Search("")
+		results := mustSearch(t, idx, "")
 
 		if len(results) != 0 {
 			t.Errorf("expected empty result, got %v", results)
 		}
 	})
 
-	t.Run("snippets include match ranges", func(t *testing.T) {
+	t.Run("stopword-only query returns no results and no error", func(t *testing.T) {
 		idx := NewIndex()
 
-		path := makeTempFile(t, "first line\nthis line mentions golang\nlast line")
+		path := makeTempFile(t, "golang is fast")
 		_ = idx.AddDocument(path)
 
-		results := idx.Search("golang")
+		results := mustSearch(t, idx, "the of and")
 
-		if len(results) != 1 {
-			t.Fatalf("expected 1 result, got %d", len(results))
-		}
-
-		want := "this line mentions golang"
-		if len(results[0].Snippets) != 1 || results[0].Snippets[0].Text != want {
-			t.Fatalf("expected snippet %q, got %v", want, results[0].Snippets)
-		}
-
-		matches := results[0].Snippets[0].Matches
-		if len(matches) != 1 {
-			t.Fatalf("expected 1 match, got %v", matches)
-		}
-
-		match := matches[0]
-		if got := results[0].Snippets[0].Text[match.Start:match.End]; got != "golang" {
-			t.Fatalf("expected match to select golang, got %q", got)
+		if len(results) != 0 {
+			t.Errorf("expected empty result, got %v", results)
 		}
 	})
 
-	t.Run("snippets highlight each query term", func(t *testing.T) {
+	t.Run("unterminated quote returns an error", func(t *testing.T) {
 		idx := NewIndex()
 
-		path := makeTempFile(t, "a search engine runs on a distributed computing system")
+		path := makeTempFile(t, "golang is fast")
 		_ = idx.AddDocument(path)
 
-		results := idx.Search("distributed computing")
+		results, err := idx.Search(`"golang fast`)
 
-		if len(results) != 1 {
-			t.Fatalf("expected 1 result, got %d", len(results))
+		if !errors.Is(err, ErrUnterminatedQuote) {
+			t.Fatalf("expected ErrUnterminatedQuote, got %v", err)
 		}
 
-		matches := results[0].Snippets[0].Matches
-		if len(matches) != 2 {
-			t.Fatalf("expected 2 matches, got %v", matches)
-		}
-
-		text := results[0].Snippets[0].Text
-		if got := text[matches[0].Start:matches[0].End]; got != "distributed" {
-			t.Fatalf("expected first match to select distributed, got %q", got)
-		}
-		if got := text[matches[1].Start:matches[1].End]; got != "computing" {
-			t.Fatalf("expected second match to select computing, got %q", got)
+		if results != nil {
+			t.Errorf("expected nil results on error, got %v", results)
 		}
 	})
+
+	t.Run("empty phrase returns an error", func(t *testing.T) {
+		idx := NewIndex()
+
+		path := makeTempFile(t, "golang is fast")
+		_ = idx.AddDocument(path)
+
+		for _, query := range []string{`""`, `"the of"`, `golang ""`} {
+			results, err := idx.Search(query)
+
+			if !errors.Is(err, ErrEmptyPhrase) {
+				t.Errorf("Search(%q) expected ErrEmptyPhrase, got %v", query, err)
+			}
+
+			if results != nil {
+				t.Errorf("Search(%q) expected nil results on error, got %v", query, results)
+			}
+		}
+	})
+
+}
+
+func TestPhraseSearch(t *testing.T) {
+	tests := []struct {
+		name  string
+		docs  []string
+		query string
+		want  []int
+	}{
+		{"adjacent words", []string{"golang search", "golang quick search", "search golang"}, `"golang search"`, []int{1}},
+		{"stopword gap", []string{"search the golang", "search a golang", "search golang"}, `"search the golang"`, []int{1, 2}},
+		{"repeated word", []string{"go go", "go fast go"}, `"go go"`, []int{1}},
+		{"multiple phrases", []string{"red fox and blue whale", "red fox", "blue whale"}, `"red fox" "blue whale"`, []int{1}},
+		{"bare term only boosts", []string{"golang search tutorial", "golang search", "tutorial"}, `"golang search" tutorial`, []int{1, 2}},
+		{"unknown phrase word", []string{"golang search"}, `"golang missing"`, nil},
+		{"across lines", []string{"golang\nsearch"}, `"golang search"`, []int{1}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx := NewIndex()
+			for _, content := range tt.docs {
+				if err := idx.AddDocument(makeTempFile(t, content)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			results := mustSearch(t, idx, tt.query)
+			if len(results) != len(tt.want) {
+				t.Fatalf("got %d results, want %d: %+v", len(results), len(tt.want), results)
+			}
+			wanted := make(map[int]bool, len(tt.want))
+			for _, id := range tt.want {
+				wanted[id] = true
+			}
+			for _, result := range results {
+				if !wanted[result.Doc.ID] {
+					t.Errorf("unexpected document %d", result.Doc.ID)
+				}
+			}
+		})
+	}
 }
 
 func TestTermFrequency(t *testing.T) {
