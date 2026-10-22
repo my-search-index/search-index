@@ -31,7 +31,7 @@ type phraseTerm struct {
 }
 
 // phrase is an ordered sequence of terms that must at the given
-// relative offsets inside a single document.
+// relative offsets occur inside a single document.
 type phrase struct {
 	Terms []phraseTerm
 }
@@ -124,7 +124,7 @@ func splitSegments(raw string) ([]segment, error) {
 		segments   []segment
 		buf        strings.Builder
 		bufStart   int  // where the current buffer began
-		inQuote    bool // are we between an opening and closing quote:
+		inQuote    bool // are we between an opening and closing quote?
 		quoteStart int  // byte offset of the currently open quote
 	)
 

@@ -222,11 +222,19 @@ func (idx *Index) buildIndex(tokens []analysis.Token, docID int) {
 
 // Search returns ranked documents for query.
 //
-// The query is parsed exactly once here; the parsed words flow through
-// candidate selection, ranking and snippet extraction. Parse failures
+// The query is parsed exactly once here; the parsed form drives candidate
+// selection, ranking and snippet extraction. Parse failures
 // (ErrUnterminatedQuote, ErrEmptyPhrase) are returned unchanged so callers can
 // use errors.Is. An empty or all-stopword query is not an error: it returns
 // no results.
+//
+// Candidate rules:
+//   - With phrases, a document must contain EVERY phrase. Bare terms never add
+//     candidates; they only raise the score of documents that already qualify.
+//     If no document contains all phrases the result is empty (there is no
+//     fallback to matching the words separately).
+//   - Without phrases, any document containing at least one bare term
+//     qualifies (OR).
 //
 // Snippets are only extracted for the top snippetResultLimit results, because
 // each one reopens and scans a source file.
@@ -236,14 +244,18 @@ func (idx *Index) Search(query string) ([]Result, error) {
 		return nil, err
 	}
 
-	words := q.words()
 	var candidates PostingList
+	var phraseMatches []PostingList // phraseMatches[i] belongs to q.Phrases[i]
 	if q.hasPhrases() {
-		candidates = idx.phraseCandidates(q.Phrases)
+		phraseMatches = make([]PostingList, len(q.Phrases))
+		for i, p := range q.Phrases {
+			phraseMatches[i] = idx.matchPhrase(p)
+		}
+		candidates = phraseCandidates(phraseMatches)
 	} else {
 		candidates = idx.unionPostings(idx.getPostings(q.Terms))
 	}
-	ranked := idx.rankDocuments(candidates, words)
+	ranked := idx.rankDocuments(candidates, q, phraseMatches)
 
 	var results []Result
 	for i, scored := range ranked {
@@ -298,68 +310,108 @@ func (idx *Index) unionPostings(lists []PostingList) PostingList {
 	return result
 }
 
-// rankDocuments scores every candidate against the query words and returns
-// them best first. While scoring it keeps each word's posting for the
-// document, so snippets can reuse the positions without another lookup.
-func (idx *Index) rankDocuments(candidates PostingList, words []string) []scoredDocs {
+// rankDocuments scores every candidate and returns them best first.
+//
+// Score = TF-IDF of every query word (phrase words and bare terms) plus, for
+// each phrase, the phrase's own TF-IDF treated as a single pseudo-term: its
+// frequency is the number of times the phrase occurs in the document and its
+// document frequency is the number of documents containing the phrase. That
+// bonus needs no tuning constant, rewards documents that repeat the phrase,
+// rewards rarer phrases more, and keeps working if Score becomes BM25.
+//
+// While scoring it also keeps the postings snippets should highlight: the bare
+// terms' postings, plus each phrase's posting, whose positions cover only the
+// phrase occurrences. Phrase words are deliberately not highlighted outside
+// the phrase.
+//
+// phraseMatches[i] belongs to q.Phrases[i]; it is nil when there are no phrases.
+func (idx *Index) rankDocuments(candidates PostingList, q parsedQuery, phraseMatches []PostingList) []scoredDocs {
 	var scoredList []scoredDocs
 
 	for _, candidate := range candidates {
-		doc := idx.Docs[candidate.DocID]
+		docID := candidate.DocID
+		doc := idx.Docs[docID]
 		totalScore := 0.0
-		var matched []Posting
+		var highlight []Posting
 
-		for _, word := range words {
+		addWord := func(word string, mark bool) {
 			list := idx.Postings[word]
-			posting := searchPosting(list, candidate.DocID)
+			posting := searchPosting(list, docID)
 			if posting.DocID == 0 {
-				continue // this word does not occur in this document, zero contribution
+				return // this word does not occur in this document, zero contribution
 			}
 			totalScore += Score(posting, doc, len(list), idx.TotalDocs)
-			matched = append(matched, posting)
+			if mark {
+				highlight = append(highlight, posting)
+			}
 		}
-		scoredList = append(scoredList, scoredDocs{doc: doc, score: totalScore, postings: matched})
+
+		for _, p := range q.Phrases {
+			for _, term := range p.Terms {
+				addWord(term.Word, false)
+			}
+		}
+		for _, term := range q.Terms {
+			addWord(term, true)
+		}
+
+		for i := range q.Phrases {
+			phrasePosting := searchPosting(phraseMatches[i], docID)
+			totalScore += Score(phrasePosting, doc, len(phraseMatches[i]), idx.TotalDocs)
+			highlight = append(highlight, phrasePosting)
+		}
+
+		scoredList = append(scoredList, scoredDocs{doc: doc, score: totalScore, postings: highlight})
 	}
 
 	// Sort by score, best first. Stable, so ties keep a deterministic order.
-	sort.Slice(scoredList, func(i, j int) bool {
+	sort.SliceStable(scoredList, func(i, j int) bool {
 		return scoredList[i].score > scoredList[j].score
 	})
 
 	return scoredList
 }
 
-// phraseCandidates returns documents that match every phrase.
-// The caller must provide at least one phrase. Bare terms do not affect this
-// candidate set; they are used later for scoring.
-func (idx *Index) phraseCandidates(phrases []phrase) PostingList {
-	candidates := idx.matchPhrase(phrases[0])
+// phraseCandidates returns the documents that match every phrase. matches[i]
+// is the result of matchPhrase for phrase i, so each list is sorted by doc ID.
+// The returned postings are the first phrase's; callers only use their DocID.
+// Bare terms do not take part: they are used later for scoring only.
+func phraseCandidates(matches []PostingList) PostingList {
+	if len(matches) == 0 {
+		return nil
+	}
 
-	for _, p := range phrases[1:] {
-		if len(candidates) == 0 {
-			return nil
-		}
+	var candidates PostingList // always a new slice, never an alias of an index list
 
-		matched := make(map[int]bool)
-		for _, posting := range idx.matchPhrase(p) {
-			matched[posting.DocID] = true
-		}
-
-		kept := candidates[:0]
-		for _, posting := range candidates {
-			if matched[posting.DocID] {
-				kept = append(kept, posting)
+	for _, posting := range matches[0] {
+		inAll := true
+		for _, other := range matches[1:] {
+			if searchPosting(other, posting.DocID).DocID == 0 {
+				inAll = false
+				break
 			}
 		}
-		candidates = kept
+		if inAll {
+			candidates = append(candidates, posting)
+		}
 	}
 	return candidates
 }
 
-// matchPhrase returns one posting per document containing the phrase at the
-// required relative positions. It starts with the shortest term posting list
-// to avoid checking documents that cannot match.
+// matchPhrase finds the documents containing the phrase at the required
+// relative positions. It starts with the shortest term posting list to avoid
+// checking documents that cannot match.
+//
+// It returns one POSTING PER MATCHING DOCUMENT, sorted by doc ID, with:
+//   - Frequency: how many times the phrase occurs in the document
+//     (overlapping occurrences count: "go go" occurs twice in "go go go").
+//   - Positions: every token position the occurrences cover, so snippets can
+//     highlight exactly the phrase words. Not necessarily sorted or unique.
 func (idx *Index) matchPhrase(p phrase) PostingList {
+	if len(p.Terms) == 0 {
+		return nil
+	}
+
 	lists := make([]PostingList, len(p.Terms))
 	shortest := 0
 
@@ -389,17 +441,30 @@ func (idx *Index) matchPhrase(p phrase) PostingList {
 				break
 			}
 		}
-		if allWordsPresent && matchesPhrasePositions(p, postings, shortest) {
-			matches = append(matches, anchor)
+		if !allWordsPresent {
+			continue
 		}
+
+		starts := phraseStarts(p, postings, shortest)
+		if len(starts) == 0 {
+			continue
+		}
+		matches = append(matches, Posting{
+			DocID:     anchor.DocID,
+			Frequency: len(starts),
+			Positions: phrasePositions(p, starts),
+		})
 	}
 	return matches
 }
 
-// matchesPhrasePositions reports whether the phrase occurs in one document.
-// The anchor may be any phrase term, so its offset is subtracted to find each
-// possible start position. Posting positions must be sorted.
-func matchesPhrasePositions(p phrase, postings []Posting, anchorIndex int) bool {
+// phraseStarts returns the start position of every occurrence of the phrase
+// in one document, ascending. postings[i] is the document's posting for
+// p.Terms[i]; the anchor may be any phrase term, so its offset is subtracted
+// to find each possible start. Posting positions must be sorted.
+func phraseStarts(p phrase, postings []Posting, anchorIndex int) []int {
+	var starts []int
+
 	for _, anchorPos := range postings[anchorIndex].Positions {
 		start := anchorPos - p.Terms[anchorIndex].Offset
 		if start < 0 {
@@ -418,10 +483,22 @@ func matchesPhrasePositions(p phrase, postings []Posting, anchorIndex int) bool 
 			}
 		}
 		if matchesHere {
-			return true
+			starts = append(starts, start)
 		}
 	}
-	return false
+	return starts
+}
+
+// phrasePositions expands start positions into every token position the
+// occurrences cover (start + each term's offset).
+func phrasePositions(p phrase, starts []int) []int {
+	positions := make([]int, 0, len(starts)*len(p.Terms))
+	for _, start := range starts {
+		for _, term := range p.Terms {
+			positions = append(positions, start+term.Offset)
+		}
+	}
+	return positions
 }
 
 // Binary search posting algo impl
