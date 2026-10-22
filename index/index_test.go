@@ -3,6 +3,8 @@ package index
 import (
 	"errors"
 	"math"
+	"reflect"
+	"sort"
 	"testing"
 )
 
@@ -16,6 +18,30 @@ func mustSearch(t *testing.T, idx *Index, query string) []Result {
 		t.Fatalf("Search(%q) unexpected error: %v", query, err)
 	}
 	return results
+}
+
+// addAll indexes the given contents in order, so document IDs are 1..n.
+func addAll(t *testing.T, contents ...string) *Index {
+	t.Helper()
+
+	idx := NewIndex()
+	for _, content := range contents {
+		if err := idx.AddDocument(makeTempFile(t, content)); err != nil {
+			t.Fatalf("AddDocument: %v", err)
+		}
+	}
+	return idx
+}
+
+// docIDs returns the sorted document IDs of results, for order-insensitive
+// comparisons.
+func docIDs(results []Result) []int {
+	ids := make([]int, 0, len(results))
+	for _, r := range results {
+		ids = append(ids, r.Doc.ID)
+	}
+	sort.Ints(ids)
+	return ids
 }
 
 func TestAddDocument_FileAccess(t *testing.T) {
@@ -436,6 +462,7 @@ func TestSearch(t *testing.T) {
 
 }
 
+// TestPhraseSearch checks WHICH documents a query returns.
 func TestPhraseSearch(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -444,11 +471,19 @@ func TestPhraseSearch(t *testing.T) {
 		want  []int
 	}{
 		{"adjacent words", []string{"golang search", "golang quick search", "search golang"}, `"golang search"`, []int{1}},
+		{"reversed order does not match", []string{"golang search", "search golang"}, `"search golang"`, []int{2}},
 		{"stopword gap", []string{"search the golang", "search a golang", "search golang"}, `"search the golang"`, []int{1, 2}},
+		{"any single word fills the gap slot", []string{"search the golang", "search a golang", "search golang", "search big golang"}, `"search the golang"`, []int{1, 2, 4}},
 		{"repeated word", []string{"go go", "go fast go"}, `"go go"`, []int{1}},
+		{"case and punctuation are ignored", []string{"GoLang Search rocks", "golang-search tools", "golang, search!", "golang x search"}, `"golang search"`, []int{1, 2, 3}},
 		{"multiple phrases", []string{"red fox and blue whale", "red fox", "blue whale"}, `"red fox" "blue whale"`, []int{1}},
+		{"later documents still match after an earlier one fails", []string{"red fox only", "blue whale only", "red fox and blue whale", "red fox and blue whale again"}, `"red fox" "blue whale"`, []int{3, 4}},
 		{"bare term only boosts", []string{"golang search tutorial", "golang search", "tutorial"}, `"golang search" tutorial`, []int{1, 2}},
+		{"bare terms never add candidates", []string{"golang search fundamentals", "golang search tutorial", "tutorial only here", "golang x search tutorial"}, `"golang search" tutorial`, []int{1, 2}},
+		{"single word phrase is a required term", []string{"golang", "python"}, `"golang" python`, []int{1}},
 		{"unknown phrase word", []string{"golang search"}, `"golang missing"`, nil},
+		{"unknown phrase word is not rescued by a bare term", []string{"golang tutorial", "tutorial only"}, `"golang zzzunknown" tutorial`, nil},
+		{"no document has the phrase: no fallback to separate words", []string{"golang is great", "search is fast"}, `"golang search"`, nil},
 		{"across lines", []string{"golang\nsearch"}, `"golang search"`, []int{1}},
 	}
 
@@ -475,6 +510,396 @@ func TestPhraseSearch(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestPhraseRanking checks the ORDER and SCORES of phrase results.
+func TestPhraseRanking(t *testing.T) {
+
+	t.Run("a bare term lifts a document that already matches the phrase", func(t *testing.T) {
+		idx := addAll(t,
+			"golang search fundamentals", // 1: phrase
+			"golang search tutorial",     // 2: phrase + bare term
+			"tutorial only here",         // 3: bare term without the phrase
+			"golang x search tutorial",   // 4: bare term, phrase split
+		)
+
+		results := mustSearch(t, idx, `"golang search" tutorial`)
+
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %v", docIDs(results))
+		}
+		if results[0].Doc.ID != 2 || results[1].Doc.ID != 1 {
+			t.Errorf("order = [%d %d], want [2 1]: the bare term should lift doc 2",
+				results[0].Doc.ID, results[1].Doc.ID)
+		}
+		if results[0].Score <= results[1].Score {
+			t.Errorf("expected strictly higher score for doc 2, got %v then %v", results[0].Score, results[1].Score)
+		}
+	})
+
+	t.Run("more occurrences of the phrase rank higher", func(t *testing.T) {
+		// Docs 1 and 2 have the same length and the same word frequencies, so
+		// only the number of phrase occurrences differs. Doc 3 keeps IDF above 0.
+		// Doc 1 is first so a correct ranking has to move doc 2 ahead of it.
+		idx := addAll(t,
+			"golang search golang pad search pad",    // 1: phrase once
+			"golang search golang search filler pad", // 2: phrase twice
+			"python rocks",                           // 3
+		)
+
+		results := mustSearch(t, idx, `"golang search"`)
+
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %v", docIDs(results))
+		}
+		if results[0].Doc.ID != 2 {
+			t.Errorf("doc 2 (phrase twice) should rank first, got doc %d", results[0].Doc.ID)
+		}
+		if results[0].Score <= results[1].Score {
+			t.Errorf("expected strictly higher score, got %v then %v", results[0].Score, results[1].Score)
+		}
+	})
+
+	t.Run("a rarer phrase scores higher than a common one", func(t *testing.T) {
+		idx := addAll(t,
+			"common words rare pair here",
+			"common words only",
+			"common words again",
+			"python rocks",
+		)
+
+		rare := mustSearch(t, idx, `"rare pair"`)
+		common := mustSearch(t, idx, `"common words"`)
+
+		if len(rare) != 1 || len(common) != 3 {
+			t.Fatalf("unexpected result sizes: %d rare, %d common", len(rare), len(common))
+		}
+		if rare[0].Score <= common[0].Score {
+			t.Errorf("rare phrase score %v should exceed common phrase score %v", rare[0].Score, common[0].Score)
+		}
+	})
+
+	t.Run("scores stay finite when the phrase is in every document", func(t *testing.T) {
+		idx := addAll(t, "golang search", "golang search again")
+
+		results := mustSearch(t, idx, `"golang search"`)
+
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(results))
+		}
+		for _, r := range results {
+			if math.IsNaN(r.Score) || math.IsInf(r.Score, 0) {
+				t.Errorf("doc %d has a non-finite score %v", r.Doc.ID, r.Score)
+			}
+		}
+	})
+}
+
+// TestPhraseSnippets checks that snippets point at the phrase and nowhere else.
+func TestPhraseSnippets(t *testing.T) {
+
+	t.Run("only phrase occurrences are highlighted", func(t *testing.T) {
+		// The first line holds the document's very first token. A stray
+		// position 0 in the phrase positions would wrongly highlight it.
+		idx := addAll(t, "golang alone here\nthe golang search phrase\nsearch alone")
+
+		results := mustSearch(t, idx, `"golang search"`)
+
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+		snippets := results[0].Snippets
+		if len(snippets) != 1 {
+			t.Fatalf("expected a snippet only for the phrase line, got %+v", snippets)
+		}
+		if got := marked(snippets[0]); !reflect.DeepEqual(got, []string{"golang", "search"}) {
+			t.Errorf("marked = %q, want [golang search]", got)
+		}
+	})
+
+	t.Run("a stopword slot inside the phrase is not highlighted", func(t *testing.T) {
+		idx := addAll(t, "we love search the golang docs")
+
+		results := mustSearch(t, idx, `"search the golang"`)
+
+		got := marked(results[0].Snippets[0])
+		if !reflect.DeepEqual(got, []string{"search", "golang"}) {
+			t.Errorf("marked = %q, want [search golang]", got)
+		}
+	})
+
+	t.Run("bare terms are highlighted next to the phrase", func(t *testing.T) {
+		idx := addAll(t, "golang search tutorial")
+
+		results := mustSearch(t, idx, `"golang search" tutorial`)
+
+		got := marked(results[0].Snippets[0])
+		if !reflect.DeepEqual(got, []string{"golang", "search", "tutorial"}) {
+			t.Errorf("marked = %q, want [golang search tutorial]", got)
+		}
+	})
+
+	t.Run("every occurrence of the phrase is highlighted", func(t *testing.T) {
+		idx := addAll(t, "golang search and again golang search")
+
+		results := mustSearch(t, idx, `"golang search"`)
+
+		got := marked(results[0].Snippets[0])
+		if len(got) != 4 {
+			t.Errorf("marked = %q, want both occurrences (4 words)", got)
+		}
+	})
+
+	t.Run("a phrase spanning a line break gets a snippet per line", func(t *testing.T) {
+		idx := addAll(t, "this ends with golang\nsearch begins the next line")
+
+		results := mustSearch(t, idx, `"golang search"`)
+
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+		if len(results[0].Snippets) != 2 {
+			t.Errorf("expected one snippet per line, got %+v", results[0].Snippets)
+		}
+	})
+}
+
+// handBuiltIndex returns an index whose postings are written out by hand, so
+// the phrase matcher is tested on exact positions with no files or analysis.
+//
+//	doc 1  golang search fundamentals      golang@0 search@1
+//	doc 2  search the golang docs          search@0 golang@2   (the@1 is a stopword)
+//	doc 3  search golang                   search@0 golang@1   (reversed)
+//	doc 4  golang x y search               golang@0 search@3   (split apart)
+//	doc 5  golang search ... golang search golang@0,4 search@1,5 (repeated)
+//	doc 6  golang golang                   golang@0,1
+//	doc 7  go go go                        go@0,1,2
+func handBuiltIndex() *Index {
+	idx := NewIndex()
+	idx.Postings["golang"] = PostingList{
+		{DocID: 1, Frequency: 1, Positions: []int{0}},
+		{DocID: 2, Frequency: 1, Positions: []int{2}},
+		{DocID: 3, Frequency: 1, Positions: []int{1}},
+		{DocID: 4, Frequency: 1, Positions: []int{0}},
+		{DocID: 5, Frequency: 2, Positions: []int{0, 4}},
+		{DocID: 6, Frequency: 2, Positions: []int{0, 1}},
+	}
+	idx.Postings["search"] = PostingList{
+		{DocID: 1, Frequency: 1, Positions: []int{1}},
+		{DocID: 2, Frequency: 1, Positions: []int{0}},
+		{DocID: 3, Frequency: 1, Positions: []int{0}},
+		{DocID: 4, Frequency: 1, Positions: []int{3}},
+		{DocID: 5, Frequency: 2, Positions: []int{1, 5}},
+	}
+	idx.Postings["go"] = PostingList{
+		{DocID: 7, Frequency: 3, Positions: []int{0, 1, 2}},
+	}
+	return idx
+}
+
+func phraseOf(terms ...phraseTerm) phrase { return phrase{Terms: terms} }
+
+// phraseHit is the part of a phrase posting the tests care about.
+type phraseHit struct {
+	Frequency int
+	Positions []int
+}
+
+// hits turns matchPhrase output into docID -> phraseHit, with positions
+// sorted so the comparison does not depend on their order.
+func hits(list PostingList) map[int]phraseHit {
+	out := make(map[int]phraseHit, len(list))
+	for _, posting := range list {
+		positions := append([]int(nil), posting.Positions...)
+		sort.Ints(positions)
+		out[posting.DocID] = phraseHit{Frequency: posting.Frequency, Positions: positions}
+	}
+	return out
+}
+
+func TestMatchPhrase(t *testing.T) {
+	idx := handBuiltIndex()
+
+	tests := []struct {
+		name   string
+		phrase phrase
+		want   map[int]phraseHit
+	}{
+		{
+			name:   "adjacent terms, with frequency and covered positions",
+			phrase: phraseOf(pt("golang", 0), pt("search", 1)),
+			want: map[int]phraseHit{
+				1: {Frequency: 1, Positions: []int{0, 1}},
+				5: {Frequency: 2, Positions: []int{0, 1, 4, 5}},
+			},
+		},
+		{
+			name:   "reversed order does not match",
+			phrase: phraseOf(pt("search", 0), pt("golang", 1)),
+			want:   map[int]phraseHit{3: {Frequency: 1, Positions: []int{0, 1}}},
+		},
+		{
+			name:   "stopword gap: only the real words are covered, not the slot",
+			phrase: phraseOf(pt("search", 0), pt("golang", 2)),
+			want:   map[int]phraseHit{2: {Frequency: 1, Positions: []int{0, 2}}},
+		},
+		{
+			name:   "larger gap matches only that distance",
+			phrase: phraseOf(pt("golang", 0), pt("search", 3)),
+			want:   map[int]phraseHit{4: {Frequency: 1, Positions: []int{0, 3}}},
+		},
+		{
+			name:   "single word phrase returns every occurrence",
+			phrase: phraseOf(pt("golang", 0)),
+			want: map[int]phraseHit{
+				1: {Frequency: 1, Positions: []int{0}},
+				2: {Frequency: 1, Positions: []int{2}},
+				3: {Frequency: 1, Positions: []int{1}},
+				4: {Frequency: 1, Positions: []int{0}},
+				5: {Frequency: 2, Positions: []int{0, 4}},
+				6: {Frequency: 2, Positions: []int{0, 1}},
+			},
+		},
+		{
+			name:   "repeated word inside a phrase",
+			phrase: phraseOf(pt("golang", 0), pt("golang", 1)),
+			want:   map[int]phraseHit{6: {Frequency: 1, Positions: []int{0, 1}}},
+		},
+		{
+			name:   "overlapping occurrences are all counted",
+			phrase: phraseOf(pt("go", 0), pt("go", 1)),
+			want:   map[int]phraseHit{7: {Frequency: 2, Positions: []int{0, 1, 1, 2}}},
+		},
+		{
+			name:   "term missing from the index",
+			phrase: phraseOf(pt("golang", 0), pt("zzzunknown", 1)),
+			want:   map[int]phraseHit{},
+		},
+		{
+			name:   "all terms indexed but never at that distance",
+			phrase: phraseOf(pt("search", 0), pt("golang", 5)),
+			want:   map[int]phraseHit{},
+		},
+		{
+			name:   "empty phrase",
+			phrase: phrase{},
+			want:   map[int]phraseHit{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := idx.matchPhrase(tt.phrase)
+
+			if !reflect.DeepEqual(hits(got), tt.want) {
+				t.Errorf("matchPhrase()\n got: %v\nwant: %v", hits(got), tt.want)
+			}
+
+			// phraseCandidates and rankDocuments binary-search these lists.
+			if !sort.SliceIsSorted(got, func(i, j int) bool { return got[i].DocID < got[j].DocID }) {
+				t.Errorf("matchPhrase() result is not sorted by DocID: %v", got)
+			}
+		})
+	}
+}
+
+// The anchor is the rarest term. The result must not depend on which term
+// that turns out to be.
+func TestMatchPhrase_SameResultWhicheverTermIsRarest(t *testing.T) {
+	want := map[int]phraseHit{
+		1: {Frequency: 1, Positions: []int{0, 1}},
+	}
+
+	idx := handBuiltIndex()
+	idx.Postings["search"] = idx.Postings["search"][:2] // "search" is now the rarest term
+	if got := hits(idx.matchPhrase(phraseOf(pt("golang", 0), pt("search", 1)))); !reflect.DeepEqual(got, want) {
+		t.Errorf("rarest = search: got %v, want %v", got, want)
+	}
+
+	idx = handBuiltIndex()
+	idx.Postings["golang"] = idx.Postings["golang"][:2] // "golang" is now the rarest term
+	if got := hits(idx.matchPhrase(phraseOf(pt("golang", 0), pt("search", 1)))); !reflect.DeepEqual(got, want) {
+		t.Errorf("rarest = golang: got %v, want %v", got, want)
+	}
+}
+
+// Matching must never write into the index's own posting lists.
+func TestMatchPhrase_DoesNotModifyIndex(t *testing.T) {
+	idx := handBuiltIndex()
+
+	idx.matchPhrase(phraseOf(pt("golang", 0), pt("search", 1)))
+	idx.matchPhrase(phraseOf(pt("go", 0), pt("go", 1)))
+
+	if !reflect.DeepEqual(idx.Postings, handBuiltIndex().Postings) {
+		t.Errorf("matchPhrase changed the index postings")
+	}
+}
+
+func TestPhraseCandidates(t *testing.T) {
+	a := PostingList{{DocID: 1}, {DocID: 3}, {DocID: 5}}
+	b := PostingList{{DocID: 3}, {DocID: 5}, {DocID: 7}}
+
+	ids := func(list PostingList) []int {
+		var out []int
+		for _, p := range list {
+			out = append(out, p.DocID)
+		}
+		return out
+	}
+
+	tests := []struct {
+		name    string
+		matches []PostingList
+		want    []int
+	}{
+		{"no phrases", nil, nil},
+		{"one phrase keeps its documents", []PostingList{a}, []int{1, 3, 5}},
+		{"two phrases keep the intersection", []PostingList{a, b}, []int{3, 5}},
+		{"a document missing early does not hide later matches", []PostingList{{{DocID: 1}, {DocID: 2}, {DocID: 3}}, {{DocID: 3}}}, []int{3}},
+		{"a phrase with no matches empties the result", []PostingList{a, nil}, nil},
+		{"the first phrase with no matches empties the result", []PostingList{nil, a}, nil},
+		{"disjoint phrases", []PostingList{{{DocID: 1}}, {{DocID: 2}}}, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ids(phraseCandidates(tt.matches))
+
+			if len(got) == 0 && len(tt.want) == 0 {
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("phraseCandidates() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPhraseCandidates_DoesNotModifyInput(t *testing.T) {
+	a := PostingList{{DocID: 1}, {DocID: 2}, {DocID: 3}}
+	b := PostingList{{DocID: 2}}
+
+	phraseCandidates([]PostingList{a, b})
+
+	if !reflect.DeepEqual(a, PostingList{{DocID: 1}, {DocID: 2}, {DocID: 3}}) {
+		t.Errorf("phraseCandidates modified its input: %v", a)
+	}
+}
+
+func TestPhrasePositions(t *testing.T) {
+	p := phraseOf(pt("search", 0), pt("golang", 2))
+
+	got := phrasePositions(p, []int{0, 10})
+
+	// Exactly the covered positions: no leading zeros, no extra entries.
+	want := []int{0, 2, 10, 12}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("phrasePositions() = %v, want %v", got, want)
+	}
+
+	if got := phrasePositions(p, nil); len(got) != 0 {
+		t.Errorf("phrasePositions() with no starts = %v, want empty", got)
 	}
 }
 
