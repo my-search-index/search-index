@@ -340,7 +340,7 @@ func (idx *Index) rankDocuments(candidates PostingList, q parsedQuery, phraseMat
 			if posting.DocID == 0 {
 				return // this word does not occur in this document, zero contribution
 			}
-			totalScore += Score(posting, doc, len(list), idx.TotalDocs)
+			totalScore += Score(posting, doc, len(list), idx.TotalDocs, idx.averageDocLength())
 			if mark {
 				highlight = append(highlight, posting)
 			}
@@ -357,7 +357,7 @@ func (idx *Index) rankDocuments(candidates PostingList, q parsedQuery, phraseMat
 
 		for i := range q.Phrases {
 			phrasePosting := searchPosting(phraseMatches[i], docID)
-			totalScore += Score(phrasePosting, doc, len(phraseMatches[i]), idx.TotalDocs)
+			totalScore += Score(phrasePosting, doc, len(phraseMatches[i]), idx.TotalDocs, idx.averageDocLength())
 			highlight = append(highlight, phrasePosting)
 		}
 
@@ -499,6 +499,17 @@ func phrasePositions(p phrase, starts []int) []int {
 		}
 	}
 	return positions
+}
+
+func (idx *Index) averageDocLength() float64 {
+	if len(idx.Docs) == 0 {
+		return 0
+	}
+	total := 0
+	for _, doc := range idx.Docs {
+		total += doc.Length
+	}
+	return float64(total) / float64(len(idx.Docs))
 }
 
 // Binary search posting algo impl
