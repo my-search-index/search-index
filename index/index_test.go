@@ -5,6 +5,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -903,68 +904,147 @@ func TestPhrasePositions(t *testing.T) {
 	}
 }
 
-func TestTermFrequency(t *testing.T) {
-	tests := []struct {
-		name    string
-		posting Posting
-		doc     Document
-		want    float64
-	}{
-		{
-			name:    "basic tf",
-			posting: Posting{Frequency: 2},
-			doc:     Document{Length: 4},
-			want:    0.5,
-		},
-		{
-			name:    "higher frequency",
-			posting: Posting{Frequency: 5},
-			doc:     Document{Length: 10},
-			want:    0.5,
-		},
-	}
+func TestAverageDocLength(t *testing.T) {
+	t.Run("empty index", func(t *testing.T) {
+		if got := NewIndex().averageDocLength(); got != 0 {
+			t.Errorf("averageDocLength() = %f, want 0", got)
+		}
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := termFrequency(tt.posting, tt.doc)
+	t.Run("mean of the stored document lengths", func(t *testing.T) {
+		// Lengths count indexed tokens, so stopwords do not count.
+		idx := addAll(t,
+			"golang fast",                         // 2
+			"golang is very fast and small",       // 4 (is, and are stopwords)
+			"alpha beta gamma delta epsilon zeta", // 6
+		)
 
-			if got != tt.want {
-				t.Errorf("termFrequency() = %f, want %f", got, tt.want)
+		if got := idx.averageDocLength(); got != 4 {
+			t.Errorf("averageDocLength() = %f, want 4", got)
+		}
+	})
+
+	t.Run("stays correct after a removal", func(t *testing.T) {
+		idx := NewIndex()
+		short := makeTempFile(t, "golang fast")                        // 2
+		medium := makeTempFile(t, "golang is very fast and small")     // 4
+		long := makeTempFile(t, "alpha beta gamma delta epsilon zeta") // 6
+		for _, path := range []string{short, medium, long} {
+			if err := idx.AddDocument(path); err != nil {
+				t.Fatal(err)
 			}
-		})
-	}
+		}
+
+		if err := idx.RemoveDocument(long); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := idx.averageDocLength(); got != 3 {
+			t.Errorf("averageDocLength() = %f, want 3", got)
+		}
+	})
+
+	t.Run("survives a save and load", func(t *testing.T) {
+		idx := addAll(t, "golang fast", "golang is very fast and small")
+		path := makeTempFile(t, "")
+		if err := idx.Save(path); err != nil {
+			t.Fatal(err)
+		}
+
+		loaded, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got, want := loaded.averageDocLength(), idx.averageDocLength(); got != want {
+			t.Errorf("averageDocLength() after load = %f, want %f", got, want)
+		}
+	})
 }
 
-func TestInverseDocumentFrequency(t *testing.T) {
-	tests := []struct {
-		name      string
-		listLen   int
-		totalDocs int
-		want      float64
-	}{
-		{
-			name:      "basic idf",
-			listLen:   2,
-			totalDocs: 10,
-			want:      math.Log(5),
-		},
-		{
-			name:      "term in all docs",
-			listLen:   10,
-			totalDocs: 10,
-			want:      0.0, // log(1)
-		},
-	}
+// TestBM25Ranking checks the two behaviors BM25 adds, end to end through Search.
+func TestBM25Ranking(t *testing.T) {
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := inverseDocumentFrequency(tt.listLen, tt.totalDocs)
+	t.Run("same term count, shorter document ranks first", func(t *testing.T) {
+		// The long document is indexed first so a correct ranking has to move
+		// the short one ahead of it. Doc 3 keeps the term's IDF meaningful.
+		idx := addAll(t,
+			"golang alpha beta gamma delta epsilon zeta eta theta iota", // 1: 10 tokens, 1 match
+			"golang fast",  // 2: 2 tokens, 1 match
+			"python rocks", // 3
+		)
 
-			if math.Abs(got-tt.want) > 1e-9 {
-				t.Errorf("idf() = %f, want %f", got, tt.want)
+		results := mustSearch(t, idx, "golang")
+
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %v", docIDs(results))
+		}
+		if results[0].Doc.ID != 2 {
+			t.Errorf("short document should rank first, got doc %d", results[0].Doc.ID)
+		}
+		if results[0].Score <= results[1].Score {
+			t.Errorf("expected strictly higher score, got %v then %v", results[0].Score, results[1].Score)
+		}
+	})
+
+	t.Run("repeating a term has diminishing returns", func(t *testing.T) {
+		// Docs 1 and 2 are the same length, so only the repeat count differs:
+		// 20 occurrences against 4. Plain TF-IDF would score doc 1 five times
+		// higher; BM25 must keep the gap small.
+		idx := addAll(t,
+			strings20("golang"), // 1: 20 occurrences
+			strings20("golang", "golang", "golang", "golang"), // 2: 4 occurrences, 16 filler
+			"python rocks", // 3: short document that keeps the average low
+		)
+
+		results := mustSearch(t, idx, "golang")
+
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %v", docIDs(results))
+		}
+		if results[0].Doc.ID != 1 {
+			t.Fatalf("more occurrences should still rank first, got doc %d", results[0].Doc.ID)
+		}
+		if ratio := results[0].Score / results[1].Score; ratio >= 2 {
+			t.Errorf("score ratio = %f, want < 2 (plain TF-IDF would give 5)", ratio)
+		}
+	})
+
+	t.Run("a term in every document still produces a positive, ordered score", func(t *testing.T) {
+		// With the old ln(N/df) IDF every score here was exactly 0.
+		idx := addAll(t, "golang is great", "golang golang fast")
+
+		results := mustSearch(t, idx, "golang")
+
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Score <= 0 {
+				t.Errorf("doc %d score = %f, want > 0", r.Doc.ID, r.Score)
 			}
-		})
+		}
+		if results[0].Doc.ID != 2 {
+			t.Errorf("doc 2 (two occurrences) should rank first, got doc %d", results[0].Doc.ID)
+		}
+	})
+}
+
+// strings20 builds a 20-token document: the given words first, padded with
+// "pad" up to 20 tokens. With a single word it repeats that word 20 times.
+func strings20(words ...string) string {
+	tokens := make([]string, 0, 20)
+	if len(words) == 1 {
+		for len(tokens) < 20 {
+			tokens = append(tokens, words[0])
+		}
+	} else {
+		tokens = append(tokens, words...)
+		for len(tokens) < 20 {
+			tokens = append(tokens, "pad")
+		}
 	}
+	return strings.Join(tokens, " ")
 }
 
 func TestAddDocuments(t *testing.T) {
